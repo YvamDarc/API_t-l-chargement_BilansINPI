@@ -27,6 +27,16 @@ DEFAULT_RECIPIENT = st.secrets.get("DEFAULT_RECIPIENT", "")
 DEFAULT_OBJECT = st.secrets.get("DEFAULT_OBJECT", "telechargement-comptes-annuels")
 
 # =========================
+# Sidebar diagnostics (important for Streamlit Cloud)
+# =========================
+with st.sidebar:
+    st.subheader("Diagnostics")
+    st.write("Token présent :", bool(TOKEN))
+    st.write("Token longueur :", len(TOKEN) if TOKEN else 0)
+    st.write("Recipient :", DEFAULT_RECIPIENT)
+    st.caption("Si Token présent = False → Secrets Streamlit Cloud non lus ou clé mal nommée.")
+
+# =========================
 # Utils
 # =========================
 def only_digits(s: str) -> str:
@@ -55,7 +65,7 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 # =========================
-# HTTP (retry + erreurs lisibles)
+# HTTP (retry + readable errors)
 # =========================
 @retry(stop=stop_after_attempt(4), wait=wait_exponential(min=1, max=10), reraise=True)
 def get_json(url: str, headers=None, params=None, timeout=35) -> dict:
@@ -98,7 +108,7 @@ def download_bytes(url: str, headers=None, timeout=70) -> bytes:
     return r.content
 
 # =========================
-# APIs (cache)
+# APIs (with cache)
 # =========================
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def reverse_postcode(lat: float, lon: float) -> Optional[str]:
@@ -120,7 +130,7 @@ def geocode_addr(addr: str) -> Tuple[Optional[float], Optional[float]]:
 
 @st.cache_data(ttl=20 * 60, show_spinner=False)
 def search_companies_by_cp(code_postal: str, code_naf: str, per_page: int = 25, page: int = 1) -> dict:
-    # ✅ API impose 1..25
+    # API imposes per_page 1..25
     per_page = max(1, min(int(per_page), 25))
     params = {"code_postal": code_postal, "page": page, "per_page": per_page}
     if code_naf:
@@ -149,6 +159,10 @@ def pick_pdf_urls(data: dict) -> List[Tuple[str, str]]:
     return out
 
 def build_zip(selected: List[Dict]) -> bytes:
+    # hard stop if token is missing (prevents confusing 401)
+    if not TOKEN:
+        raise RuntimeError("Token API Entreprise absent. Mets API_ENTREPRISE_TOKEN dans les Secrets Streamlit Cloud.")
+
     buf = io.BytesIO()
     headers = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -170,7 +184,7 @@ def build_zip(selected: List[Dict]) -> bytes:
                 continue
 
             for filename, url in pdfs:
-                time.sleep(0.3)
+                time.sleep(0.3)  # avoid bursts
                 try:
                     content = download_bytes(url, headers=headers)
                     zf.writestr(f"{folder}/{filename}", content)
@@ -194,9 +208,9 @@ st.session_state.setdefault("last_cp", None)
 st.title("Carte → entreprises les plus proches → téléchargement bilans (ZIP)")
 
 if not TOKEN:
-    st.error("Secret manquant : API_ENTREPRISE_TOKEN")
+    st.error("Token manquant : ajoute API_ENTREPRISE_TOKEN dans les Secrets Streamlit Cloud.")
 if not DEFAULT_RECIPIENT:
-    st.warning("Secret manquant : DEFAULT_RECIPIENT (SIRET organisme). Sans ça, l’API Entreprise peut refuser.")
+    st.warning("Recipient manquant : ajoute DEFAULT_RECIPIENT (SIRET).")
 
 left, right = st.columns([1.25, 1])
 
@@ -206,15 +220,18 @@ with left:
     naf_in = st.text_input("Filtre NAF (optionnel) — ex: 56.10A", value="", key="naf_input")
     naf = normalize_naf(naf_in)
 
-    candidates_per_page = st.slider("Taille du pool candidat (max 25 imposé par l’API)", 10, 25, 25, 5)
-    use_two_pages = st.checkbox("Prendre 2 pages (jusqu’à 50 candidats) pour mieux trouver les plus proches", value=True)
+    candidates_per_page = st.slider("Pool candidat (max 25)", 10, 25, 25, 5)
+    use_two_pages = st.checkbox("Prendre 2 pages (jusqu’à 50 candidats)", value=True)
 
     default_center = st.session_state["click_latlon"] or (48.5, -2.8)
     m = folium.Map(location=default_center, zoom_start=10, control_scale=True)
 
     if st.session_state["click_latlon"]:
-        folium.Marker(st.session_state["click_latlon"], tooltip="Point sélectionné",
-                      icon=folium.Icon(color="red")).add_to(m)
+        folium.Marker(
+            st.session_state["click_latlon"],
+            tooltip="Point sélectionné",
+            icon=folium.Icon(color="red"),
+        ).add_to(m)
 
     map_state = st_folium(m, height=520, width=None)
 
@@ -245,7 +262,6 @@ with left:
 
                 st.session_state["last_cp"] = cp
 
-                # ✅ on respecte per_page <= 25 ; option 2 pages
                 try:
                     with st.spinner(f"Recherche entreprises (CP {cp})…"):
                         res1 = search_companies_by_cp(code_postal=cp, code_naf=naf, per_page=candidates_per_page, page=1)
@@ -255,7 +271,7 @@ with left:
                             results += (res2.get("results") or res2.get("entreprises") or [])
                 except Exception as e:
                     st.error("Erreur sur recherche-entreprises.api.gouv.fr")
-                    st.write({"code_postal": cp, "code_naf": naf, "per_page": candidates_per_page, "pages": 2 if use_two_pages else 1})
+                    st.write({"code_postal": cp, "code_naf": naf, "per_page": candidates_per_page})
                     st.exception(e)
                     st.stop()
 
@@ -339,6 +355,10 @@ with right:
 
     disabled = (len(selected_rows) == 0) or (not TOKEN) or (not DEFAULT_RECIPIENT)
     if st.button("4) Télécharger les bilans (ZIP)", disabled=disabled):
+        if not TOKEN:
+            st.error("Token API Entreprise absent. Mets API_ENTREPRISE_TOKEN dans les Secrets Streamlit Cloud.")
+            st.stop()
+
         with st.spinner("Téléchargement + création du ZIP…"):
             zip_bytes = build_zip(selected_rows)
 
@@ -348,6 +368,3 @@ with right:
             file_name="bilans_selection.zip",
             mime="application/zip",
         )
-
-    if not TOKEN or not DEFAULT_RECIPIENT:
-        st.warning("Secrets requis : API_ENTREPRISE_TOKEN + DEFAULT_RECIPIENT (SIRET).")
